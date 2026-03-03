@@ -5,6 +5,7 @@ from shutil import move
 from time import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Union
+import sys
 
 from aiofiles import open
 from httpx import HTTPStatusError, RequestError, StreamError
@@ -19,6 +20,7 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
+# 注意：以下导入路径需根据你的项目结构调整，保持和原代码一致
 from ..custom import (
     MAX_WORKERS,
     PROGRESS,
@@ -35,7 +37,6 @@ from ..translation import _
 
 if TYPE_CHECKING:
     from httpx import AsyncClient
-
     from ..config import Parameter
 
 __all__ = ["Downloader"]
@@ -78,7 +79,7 @@ class Downloader:
         self.static_cover = params.static_cover
         self.proxy = params.proxy
         self.proxy_tiktok = params.proxy_tiktok
-        self.download = params.download
+        self.download = params.download  # 下载总开关
         self.max_size = params.max_size
         self.chunk = params.chunk
         self.max_retry = params.max_retry
@@ -90,6 +91,12 @@ class Downloader:
         self.general_progress_object: Callable = self.init_general_progress(
             server_mode,
         )
+
+        # 新增：校验下载开关是否开启，避免静默退出
+        if not self.download:
+            self.log.warning(_("⚠️ 下载开关未开启！请在settings.json中设置\"download\": true"))
+            # 注释主动退出逻辑，改为提示
+            # sys.exit(0)
 
     def init_general_progress(
         self,
@@ -144,6 +151,27 @@ class Downloader:
             transient=True,
             expand=True,
         )
+    
+    def write_full_desc_to_txt(self, content: str, file_path: Path):
+        """
+        同步写入完整作品文案到TXT文件（修复异步冲突，避免闪退）
+        :param content: 完整的原始文案
+        :param file_path: 作品文件路径（视频/图集）
+        """
+        if not content:
+            self.log.info(f"【TXT写入】{file_path.name} 无完整文案，跳过")
+            return
+        # 拼接TXT路径（与作品同目录、同名）
+        txt_path = file_path.with_suffix(".txt")
+        # 确保目录存在
+        txt_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # 同步写入，避免异步事件循环冲突
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(content.strip())
+            self.log.info(f"【TXT写入】完整文案已保存至: {txt_path.resolve()}")
+        except Exception as e:
+            self.log.error(f"【TXT写入】失败: {e}")
 
     async def run(
         self,
@@ -152,12 +180,18 @@ class Downloader:
         tiktok=False,
         **kwargs,
     ) -> None:
-        if not self.download or not data:
+        # 新增：校验下载开关和数据有效性
+        if not self.download:
+            self.log.error(_("❌ 下载功能未启用！请在配置文件中开启download开关"))
             return
+        if not data:
+            self.log.warning(_("⚠️ 无下载数据，跳过下载"))
+            return
+        
         self.log.info(_("开始下载作品文件"))
         match type_:
             case "batch":
-                await self.run_batch(data, tiktok, **kwargs)
+                await self.run_batch(data, tiktok,** kwargs)
             case "detail":
                 await self.run_general(data, tiktok, **kwargs)
             case "music":
@@ -296,7 +330,12 @@ class Downloader:
             skipped_live=set(),
         )
         tasks = []
+        # 新增：存储TXT写入任务（下载完成后统一执行，避免打断下载流程）
+        txt_write_tasks = []
+        
         for item in data:
+            # 备份完整文案到full_desc字段，再执行截断
+            item["full_desc"] = item["desc"]
             item["desc"] = beautify_string(
                 item["desc"],
                 self.desc_length,
@@ -315,18 +354,31 @@ class Downloader:
                 "temp_root": temp_root,
                 "actual_root": actual_root,
             }
+            
+            # 记录TXT写入任务（不同类型作品的路径）
+            content = item.get("full_desc") or item.get("desc", "").strip()
             if (t := item["type"]) == _("图集"):
                 await self.download_image(
                     **params,
                     type_=_("图集"),
                     skipped=count.skipped_image,
                 )
+                # 暂存TXT写入任务
+                txt_write_tasks.append({
+                    "content": content,
+                    "file_path": actual_root.with_name(f"{name}_1.jpeg")
+                })
             elif t == _("视频"):
                 await self.download_video(
                     **params,
                     type_=_("视频"),
                     skipped=count.skipped_video,
                 )
+                # 暂存TXT写入任务
+                txt_write_tasks.append({
+                    "content": content,
+                    "file_path": actual_root.with_name(f"{name}.mp4")
+                })
             elif t == _("实况"):
                 await self.download_image(
                     suffix="mp4",
@@ -334,16 +386,31 @@ class Downloader:
                     **params,
                     skipped=count.skipped_live,
                 )
+                # 暂存TXT写入任务
+                txt_write_tasks.append({
+                    "content": content,
+                    "file_path": actual_root.with_name(f"{name}_1.mp4")
+                })
             else:
                 raise DownloaderError(_("不支持的作品类型: {type_}").format(type_=t))
-            self.download_music(
-                **params,
-                type=_("音乐"),
-            )
+            
+            self.download_music(** params, type=_("音乐"))
             self.download_cover(**params)
+        
+        # 第一步：执行下载任务（核心）
         await self.downloader_chart(
             tasks, count, self.general_progress_object(), **kwargs
         )
+        
+        # 第二步：下载完成后，统一写入TXT文案（避免打断下载流程）
+        self.log.info(_("开始写入作品文案TXT文件..."))
+        for task in txt_write_tasks:
+            self.write_full_desc_to_txt(
+                content=task["content"],
+                file_path=task["file_path"]
+            )
+        
+        # 统计下载结果
         self.statistics_count(count)
 
     async def downloader_chart(
@@ -351,15 +418,17 @@ class Downloader:
         tasks: list[tuple],
         count: SimpleNamespace,
         progress: Progress,
-        semaphore: Semaphore = None,
-        **kwargs,
+        semaphore: Semaphore = None,** kwargs,
     ):
+        if not tasks:
+            self.log.info(_("⚠️ 无待下载任务"))
+            return
+        
         with progress:
             tasks = [
                 self.request_file(
                     *task,
-                    count=count,
-                    **kwargs,
+                    count=count,** kwargs,
                     progress=progress,
                     semaphore=semaphore,
                 )
@@ -493,8 +562,7 @@ class Downloader:
         key: str = "music_url",
         switch: bool = False,
         suffix: str = "mp3",
-        type_: str = _("音乐"),
-        **kwargs,
+        type_: str = _("音乐"),** kwargs,
     ) -> None:
         target_path = actual_root.with_name(f"{name}.{suffix}")
         if self.check_deal_music(url := item.get(key), target_path, switch):
@@ -521,8 +589,7 @@ class Downloader:
         temp_root: Path,
         actual_root: Path,
         static_suffix: str = "jpeg",
-        dynamic_suffix: str = "webp",
-        **kwargs,
+        dynamic_suffix: str = "webp",** kwargs,
     ) -> None:
         # 静态封面下载
         if all(
@@ -643,40 +710,11 @@ class Downloader:
                 self.log.error(str(e))
                 return False
             except Exception as e:
-                self.log.error(_("下载文件时发生未知错误: {error}").format(error=repr(e)))
+                self.log.error(_("下载文件时发生未知异常: {show} - {error}").format(show=show, error=str(e)))
+                self.delete(temp)
                 return False
 
-    # ------------------------------ 缺失的辅助方法补全 ------------------------------
-    def storage_folder(self, mode: str, *args) -> Path:
-        """生成存储文件夹（根据业务逻辑补全，此处为占位实现）"""
-        if mode == "detail":
-            return self.root.joinpath(self.folder_name)
-        return self.root.joinpath(mode, *args)
-
-    def data_classification(self, mode: str, *args) -> tuple:
-        """数据分类（占位实现）"""
-        return args
-
-    def create_detail_folder(self, root: Path, name: str, folder_mode: bool) -> Path:
-        """创建详情文件夹（占位实现）"""
-        if folder_mode:
-            return root.joinpath(name)
-        return root
-
-    def generate_music_name(self, item: dict) -> str:
-        """生成音乐文件名（占位实现）"""
-        return self.cleaner.filter_name(
-            item.get("music_name", f"music_{item['id']}"),
-            default=f"music_{item['id']}"
-        )
-
-    def generate_detail_name(self, item: dict) -> str:
-        """生成作品详情文件名（占位实现）"""
-        return self.cleaner.filter_name(
-            beautify_string(item.get("desc", f"video_{item['id']}"), self.name_length),
-            default=f"video_{item['id']}"
-        )
-
+    # ------------------------------ 辅助方法 ------------------------------
     def __adapter_headers(self, headers: dict = None, tiktok: bool = False) -> dict:
         """适配请求头"""
         base_headers = self.headers_tiktok if tiktok else self.headers
@@ -685,8 +723,9 @@ class Downloader:
         return base_headers
 
     def __record_request_messages(self, show: str, url: str, headers: dict):
-        """记录请求日志（占位实现）"""
-        self.log.debug(_("开始下载: {show} | URL: {url}").format(show=show, url=url))
+        """记录请求日志"""
+        self.log.debug(f"【下载请求】{show} - URL: {url}")
+        self.log.debug(f"【请求头】{headers}", False)
 
     def __update_headers_range(self, headers: dict, temp: Path) -> int:
         """更新Range请求头，支持断点续传"""
@@ -709,7 +748,7 @@ class Downloader:
         return length, suffix
 
     def _record_response(self, response, show: str, length: int):
-        """记录响应日志（占位实现）"""
+        """记录响应日志"""
         self.log.debug(
             _("下载响应: {show} | 状态码: {code} | 内容长度: {size}").format(
                 show=show,
@@ -764,20 +803,17 @@ class Downloader:
             # 下载完成后移动临时文件到目标位置
             if position >= length or length == 0:
                 self.move(temp, actual)
-                await self.recorder.add_id(id_)
+                await self.recorder.record_id(id_)  # 原代码是add_id，统一为record_id
                 
                 # 更新统计
                 if "图集" in show or "实况" in show:
                     count.downloaded_image.add(id_)
                 elif "视频" in show:
                     count.downloaded_video.add(id_)
-                elif "音乐" in show:
-                    pass  # 音乐单独统计
-                elif "封面" in show or "动图" in show:
-                    pass  # 封面不统计主任务
+                elif "直播" in show:
+                    count.downloaded_live.add(id_)
                 
-                self.log.info(_("【{show}】下载完成").format(show=show))
-                self.log.info(f"文件路径: {actual.resolve()}", False)
+                self.log.info(_("【{show}】下载完成: {path}").format(show=show, path=actual.resolve()))
                 progress.remove_task(task_id)
                 return True
             else:
@@ -794,7 +830,7 @@ class Downloader:
             return False
 
     def delete(self, path: Path):
-        """删除文件（占位实现）"""
+        """删除文件"""
         if path.exists():
             path.unlink(missing_ok=True)
 
@@ -803,17 +839,46 @@ class Downloader:
         move(src, dst)
 
     def statistics_count(self, count: SimpleNamespace):
-        """统计下载数量（占位实现）"""
-        self.log.info(_("下载统计:"))
-        self.log.info(_("图集 - 已下载: {d} | 已跳过: {s}").format(
-            d=len(count.downloaded_image),
-            s=len(count.skipped_image)
-        ))
-        self.log.info(_("视频 - 已下载: {d} | 已跳过: {s}").format(
-            d=len(count.downloaded_video),
-            s=len(count.skipped_video)
-        ))
-        self.log.info(_("实况 - 已下载: {d} | 已跳过: {s}").format(
-            d=len(count.downloaded_live),
-            s=len(count.skipped_live)
-        ))
+        """统计下载数量"""
+        self.log.info(_("========== 下载完成统计 =========="))
+        self.log.info(_("视频 - 下载: {0} | 跳过: {1}").format(len(count.downloaded_video), len(count.skipped_video)))
+        self.log.info(_("图集/实况 - 下载: {0} | 跳过: {1}").format(len(count.downloaded_image), len(count.skipped_image)))
+        self.log.info(_("直播 - 下载: {0} | 跳过: {1}").format(len(count.downloaded_live), len(count.skipped_live)))
+        self.log.info(_("=================================="))
+
+    def storage_folder(self, mode: str, *args) -> Path:
+        """生成存储文件夹路径"""
+        if mode == "detail":
+            return self.root.joinpath(self.folder_name)
+        return self.root.joinpath(self.folder_name, *args)
+
+    def data_classification(self, mode: str, *args) -> tuple:
+        """数据分类"""
+        return args[:-1] if mode in ["user", "mix", "collect"] else args
+
+    def create_detail_folder(self, root: Path, name: str, folder_mode: bool) -> Path:
+        """创建详情文件夹"""
+        if folder_mode:
+            root = root.joinpath(name)
+        return root
+
+    def generate_detail_name(self, item: dict) -> str:
+        """生成作品详情名称"""
+        name = self.name_format.format(
+            id=item["id"],
+            desc=item["desc"],
+            author=item.get("author", ""),
+            time=datetime.fromtimestamp(item.get("create_time", 0)).strftime("%Y%m%d%H%M%S"),
+        )
+        return self.cleaner.filter_name(
+            name[:self.name_length],
+            f"{item['id']}_{int(time())}",
+        )
+
+    def generate_music_name(self, item: dict) -> str:
+        """生成音乐名称"""
+        name = f"{item.get('music_name', '')}{self.split}{item.get('author', '')}"
+        return self.cleaner.filter_name(
+            name[:self.name_length],
+            f"{item['id']}_{int(time())}",
+        )
