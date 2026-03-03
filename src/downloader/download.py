@@ -6,7 +6,7 @@ from time import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Union
 
-from aiofiles import open
+from aiofiles import open as aopen  # 避免与内置 open 冲突
 from httpx import HTTPStatusError, RequestError, StreamError
 from rich.progress import (
     BarColumn,
@@ -35,7 +35,6 @@ from ..translation import _
 
 if TYPE_CHECKING:
     from httpx import AsyncClient
-
     from ..config import Parameter
 
 __all__ = ["Downloader"]
@@ -76,8 +75,6 @@ class Downloader:
         self.music = params.music
         self.dynamic_cover = params.dynamic_cover
         self.static_cover = params.static_cover
-        # self.cookie = params.cookie
-        # self.cookie_tiktok = params.cookie_tiktok
         self.proxy = params.proxy
         self.proxy_tiktok = params.proxy_tiktok
         self.download = params.download
@@ -146,6 +143,23 @@ class Downloader:
             transient=True,
             expand=True,
         )
+
+    async def write_desc_to_txt(self, content: str, file_path: Path):
+        """
+        将作品描述写入TXT文件（适配exe版本，UTF-8编码）
+        :param content: 作品完整描述
+        :param file_path: 用于确定 .txt 文件名和目录的参考路径（通常为主媒体文件路径）
+        """
+        if not content:
+            self.log.info("【TXT写入】无作品描述，跳过")
+            return
+        txt_path = file_path.with_suffix(".txt")
+        try:
+            async with aopen(txt_path, "w", encoding="utf-8") as f:
+                await f.write(content.strip())
+            self.log.info(f"【TXT写入】描述已保存至: {txt_path}")
+        except Exception as e:
+            self.log.error(f"【TXT写入】失败: {e}")
 
     async def run(
         self,
@@ -338,11 +352,15 @@ class Downloader:
                 )
             else:
                 raise DownloaderError
-            self.download_music(
-                **params,
-                type=_("音乐"),
-            )
+            self.download_music(**params, type=_("音乐"))
             self.download_cover(**params)
+
+            # >>>>>>>>>>> 写入作品描述 TXT 文件 <<<<<<<<<<<
+            # 统一使用 {作品名}.txt，放在作品实际目录下
+            desc_file_path = actual_root.parent / f"{name}.txt"
+            await self.write_desc_to_txt(item["desc"], desc_file_path)
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
         await self.downloader_chart(
             tasks, count, self.general_progress_object(), **kwargs
         )
@@ -608,7 +626,6 @@ class Downloader:
                 headers,
             )
             try:
-                # length, suffix = await self.__head_file(client, url, headers, suffix, )
                 position = self.__update_headers_range(
                     headers,
                     temp,
@@ -701,7 +718,7 @@ class Downloader:
             completed=position,
         )
         try:
-            async with open(cache, "ab") as f:
+            async with aopen(cache, "ab") as f:
                 async for chunk in response.aiter_bytes(self.chunk):
                     await f.write(chunk)
                     progress.update(task_id, advance=len(chunk))
@@ -714,7 +731,6 @@ class Downloader:
             self.log.warning(
                 _("{show} 下载中断，错误信息：{error}").format(show=show, error=e)
             )
-            # self.delete_file(cache)
             await self.recorder.delete_id(id_)
             return False
         self.save_file(cache, actual)
@@ -731,7 +747,6 @@ class Downloader:
         headers: dict,
     ):
         self.log.info(f"{show} URL: {url}", False)
-        # 请求头脱敏处理，不记录 Cookie
         desensitize = {k: v for k, v in headers.items() if k != "Cookie"}
         self.log.info(f"{show} Headers: {desensitize}", False)
 
@@ -835,9 +850,7 @@ class Downloader:
         return root.joinpath(name) if folder_mode else root
 
     @staticmethod
-    def delete(
-        temp: "Path",
-    ):
+    def delete(temp: "Path"):
         if temp.is_file():
             temp.unlink()
 
@@ -895,25 +908,6 @@ class Downloader:
             False,
         )
 
-    async def __head_file(
-        self,
-        client: "AsyncClient",
-        url: str,
-        headers: dict,
-        suffix: str,
-    ) -> tuple[int, str]:
-        response = await client.head(
-            url,
-            headers=headers,
-        )
-        if response.status_code == 405:
-            return 0, suffix
-        response.raise_for_status()
-        return self._extract_content(
-            response.headers,
-            suffix,
-        )
-
     def _extract_content(
         self,
         headers: dict,
@@ -942,9 +936,6 @@ class Downloader:
         length: int = 0,
     ) -> int:
         position = self.__get_resume_byte_position(file)
-        # if length and position >= length:
-        #     self.delete(file)
-        #     position = 0
         headers["Range"] = f"bytes={position}-"
         return position
 
@@ -963,16 +954,16 @@ class Downloader:
         unknown_size: bool,
         show: str,
     ) -> int:
-        if not length and not unknown_size:  # 响应内容大小判断
+        if not length and not unknown_size:
             self.log.warning(_("{show} 响应内容为空").format(show=show))
-            return -1  # 执行重试
+            return -1
         if all(
             (
                 self.max_size,
                 length,
                 length > self.max_size,
             )
-        ):  # 文件下载跳过判断
+        ):
             self.log.info(_("{show} 文件大小超出限制，跳过下载").format(show=show))
-            return 0  # 跳过下载
-        return 1  # 继续下载
+            return 0
+        return 1
