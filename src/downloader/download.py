@@ -4,9 +4,9 @@ from pathlib import Path
 from shutil import move
 from time import time
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Union
+from typing import TYPE_CHECKING, Callable, Union, Set
 
-from aiofiles import open as aopen  # 避免与内置 open 冲突
+from aiofiles import open as aopen
 from httpx import HTTPStatusError, RequestError, StreamError
 from rich.progress import (
     BarColumn,
@@ -89,6 +89,8 @@ class Downloader:
         self.general_progress_object: Callable = self.init_general_progress(
             server_mode,
         )
+        # 用于防止图集/实况重复写入描述
+        self._written_desc: Set[str] = set()
 
     def init_general_progress(
         self,
@@ -355,12 +357,6 @@ class Downloader:
             self.download_music(**params, type=_("音乐"))
             self.download_cover(**params)
 
-            # >>>>>>>>>>> 写入作品描述 TXT 文件 <<<<<<<<<<<
-            # 统一使用 {作品名}.txt，放在作品实际目录下
-            desc_file_path = actual_root.parent / f"{name}.txt"
-            await self.write_desc_to_txt(item["desc"], desc_file_path)
-            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
         await self.downloader_chart(
             tasks, count, self.general_progress_object(), **kwargs
         )
@@ -415,7 +411,7 @@ class Downloader:
         tasks: list,
         name: str,
         id_: str,
-        item: SimpleNamespace,
+        item: dict,  # 注意：此处应为 dict，不是 SimpleNamespace
         skipped: set,
         temp_root: Path,
         actual_root: Path,
@@ -429,6 +425,14 @@ class Downloader:
                 )
             )
             return
+
+        # >>>>>>>>>>> 新增：写入描述（仅首次） <<<<<<<<<<<
+        if id_ not in self._written_desc and item.get("desc"):
+            desc_path = actual_root.parent / f"{name}.txt"
+            await self.write_desc_to_txt(item["desc"], desc_path)
+            self._written_desc.add(id_)
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
         for index, img in enumerate(
             item["downloads"],
             start=1,
@@ -466,7 +470,7 @@ class Downloader:
         tasks: list,
         name: str,
         id_: str,
-        item: SimpleNamespace,
+        item: dict,  # 注意：此处应为 dict
         skipped: set,
         temp_root: Path,
         actual_root: Path,
@@ -493,7 +497,14 @@ class Downloader:
             )
             self.log.info(f"文件路径: {p.resolve()}", False)
             skipped.add(id_)
+            # >>>>>>>>>>> 即使跳过，也写描述（如果还没写） <<<<<<<<<<<
+            if id_ not in self._written_desc and item.get("desc"):
+                desc_path = actual_root.parent / f"{name}.txt"
+                await self.write_desc_to_txt(item["desc"], desc_path)
+                self._written_desc.add(id_)
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
             return
+
         tasks.append(
             (
                 item["downloads"],
@@ -504,6 +515,13 @@ class Downloader:
                 suffix,
             )
         )
+
+        # >>>>>>>>>>> 新增：写入描述（仅首次） <<<<<<<<<<<
+        if id_ not in self._written_desc and item.get("desc"):
+            desc_path = actual_root.parent / f"{name}.txt"
+            await self.write_desc_to_txt(item["desc"], desc_path)
+            self._written_desc.add(id_)
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def download_music(
         self,
@@ -543,7 +561,7 @@ class Downloader:
         tasks: list,
         name: str,
         id_: str,
-        item: SimpleNamespace,
+        item: dict,  # 修改为 dict
         temp_root: Path,
         actual_root: Path,
         static_suffix: str = "jpeg",
@@ -595,7 +613,6 @@ class Downloader:
         path: Path,
         switch=False,
     ) -> bool:
-        """未传入 switch 参数则判断音乐下载开关设置"""
         return all((switch or self.music, url, not self.is_exists(path)))
 
     @Retry.retry
